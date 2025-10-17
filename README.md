@@ -1,18 +1,21 @@
 # ShortSearch — 超輕量新聞/網頁搜尋摘要伺服器
 
 一個面向 **Open-WebUI** 的本機 FastAPI 服務：
-先在工具端做**去噪、去重、摘要與硬性字數預算**，再把**極短 JSON**回傳給 LLM，徹底降低 token 開銷。
+先在工具端做**去噪、去重、摘要與硬性字元預算**，再把**極短 JSON** 回傳給 LLM，徹底降低 token 開銷。
 
 ---
 
-## ✨ 功能重點
+## ✨ 重點更新（相對於上一版）
 
-* **極短輸出（budget）**：每次呼叫按 `budget`（字元上限）裁切，避免爆上下文
-* **來源整潔**：RSS 抓取 → Readability 正文抽取（trafilatura）→ **TextRank/前幾句**摘要
-* **相似去重**：SimHash 群集，保留代表篇
-* **查詢匹配更穩**：標題/內文正規化比對（NFKC、大小寫、空白），並有**兩段 fallback**
-* **快取**：`url → 正文`（24h）、`q → 結果`（8h）；**0 筆不寫入快取**
-* **CORS 已開**：Open-WebUI 能載入 `/openapi.json`（避免 OPTIONS 405）
+* **來源帶屬性：** `pick_sources()` 回傳 `{"url", "is_search"}`；
+  **Google News RSS（is_search=True）不再做關鍵字二次過濾**，固定來源（is_search=False）才本地過濾。
+* **偵錯輸出：** `debug=1` 或環境變數 `SHORTSEARCH_DEBUG=1` 會附帶 `diagnostics`（來源清單、計數、耗時等），並把空 feed 落地到 `./_debug/`。
+* **匹配模式：** `match=auto|title|any|off`（預設 `auto`）。
+
+  > 只有 **非搜尋來源** 會套用匹配模式；搜尋來源（GNews）直接通過。
+* **Google News 轉址解析更穩：** 辨識 `news.google.com/(rss/)articles/…`，並以標準 UA 追跳轉。
+* **CJK 友善摘要：** 中文/日文/韓文直接用簡易句切，摘要更貼近原文。
+* **快取鍵更新：** `qcache` 納入 `budget` 與 `match`，避免「不同預算/模式命中舊結果」。
 
 ---
 
@@ -21,6 +24,7 @@
 ```
 shortsearch.py
 shortsearch.db          # 首次啟動後產生
+_debug/                 # debug=1 時可能生成（RSS 原文、log）
 ```
 
 ---
@@ -28,8 +32,8 @@ shortsearch.db          # 首次啟動後產生
 ## 系統需求
 
 * Python 3.11+（建議）
-* pip 可用的網路環境（首次安裝依賴）
-  -（可選）WSL/Ubuntu
+* 可用網路（首次安裝依賴）
+* 可選：WSL/Ubuntu
 
 ---
 
@@ -42,7 +46,7 @@ python -m venv .venv && source .venv/bin/activate
 # 基本依賴
 pip install fastapi uvicorn httpx trafilatura simhash feedparser
 
-# 可選：更佳的摘要品質（TextRank）
+# 可選：提升英文摘要品質（TextRank）
 pip install sumy
 ```
 
@@ -50,13 +54,13 @@ pip install sumy
 
 ## 啟動
 
-方式 A（直接跑檔案）：
+**方式 A**（直接跑檔案）
 
 ```bash
 python shortsearch.py
 ```
 
-方式 B（使用 uvicorn）：
+**方式 B**（uvicorn）
 
 ```bash
 uvicorn shortsearch:app --host 127.0.0.1 --port 8777 --log-level info
@@ -78,23 +82,46 @@ http://127.0.0.1:8777/openapi.json
 
 ## 與 Open-WebUI 整合
 
-1. 打開 **Settings → Tools → Add custom tool**
+1. Settings → Tools → **Add custom tool**
 2. **Name**：`ShortSearch`
 3. **OpenAPI URL**：`http://127.0.0.1:8777/openapi.json`
-4. 儲存後（必要時按 **Refresh**），工具會註冊 `search_news` 與 `fetch` 兩個端點
+4. 儲存（必要時 **Refresh**）後可使用 `search_news` 與 `fetch`
 
-> 建議在工具的 Default Args 裡**不要**預設 `n` 太大；推薦 `n=5`、`budget=1000~1200`。
+> 建議在工具 Default Args：`n=5`、`budget=1000~1200`。
 
 ---
 
-## API 一覽
+## 來源選擇與流程
+
+* **有關鍵字 `q`** 且 `USE_GOOGLE_NEWS=True`：
+  來源為 **[Google News(搜尋) + 固定 RSS 列表]**。
+
+  * Google News URL 由 `build_gnews_url(q, site)` 組成
+  * `SITE_FILTERS`（全域白名單）會以 `site:` OR 條件加入搜尋
+* **沒有關鍵字**（或關閉 `USE_GOOGLE_NEWS`）：
+  僅使用 **固定 RSS 列表**。
+
+**重要：**
+
+* **搜尋來源（is_search=True）**：**不再做關鍵字過濾**（因為 GNews 已經是搜尋結果）。
+* **固定來源（is_search=False）**：才會做標題/內文的本地關鍵字匹配。
+
+每則條目都會（在 `urlcache` 未命中時）進一步抓目標頁面，用 `trafilatura` 抽正文，並做摘要、去重與排序。
+
+---
+
+## API
 
 ### `GET /health`
 
-回傳服務健康狀態。
+回傳服務健康狀態與來源設定。
 
 ```json
-{"ok": true}
+{
+  "ok": true,
+  "use_google_news": true,
+  "site_filters": []
+}
 ```
 
 ### `GET /search_news`
@@ -103,50 +130,62 @@ http://127.0.0.1:8777/openapi.json
 
 **Query 參數**
 
-* `q` *(必填)*：關鍵字（支援空白分詞，任一命中即通過）
-* `n` *(選填)*：最多返回篇數，**1–8**（預設 5；伺服器端會再夾到 8）
-* `lang` *(選填)*：`zh` / `en`（目前僅用於摘要與分句策略，預設 `zh`）
+* `q` *(必填)*：關鍵字（空白分詞；固定來源會套用匹配）
+* `n` *(選填)*：最多返回篇數，**1–10**（預設 5；伺服器端夾範圍）
+* `lang` *(選填)*：`zh` / `en`（影響摘要策略；預設 `zh`）
 * `budget` *(選填)*：總字元上限，**300–4000**（預設 1200）
+* `site` *(選填)*：僅搜尋特定站台（只影響 **Google News**）
+* `match` *(選填)*：`auto|title|any|off`（**只對非搜尋來源生效**；預設 `auto`）
+* `debug` *(選填)*：`1` 開啟診斷輸出（回傳 `diagnostics`，並將空 feed 存到 `_debug/`）
 
 **回應範例**
 
 ```json
 {
   "q": "AI 教育",
-  "generated_at": "2025-10-14T14:20:00+08:00",
+  "site": null,
+  "match": "auto",
+  "generated_at": "2025-10-17T09:30:00+08:00",
   "items": [
     {
-      "t": "教育部推AI課程試辦",
+      "t": "教育部推 AI 課程試辦",
       "u": "https://example.com/a1",
-      "d": "2025-10-14",
+      "d": "2025-10-16",
       "src": "中央社",
-      "brief": "教育部宣布高中階段試辦AI課程，重點在運算思維與倫理。",
+      "brief": "教育部宣布高中階段試辦 AI 課程，重點在運算思維與倫理。",
       "bul": ["2025年10月", "試辦", "課綱調整"],
       "ents": [],
       "cat": ""
     }
   ],
-  "note": "共 3 則；已去重、壓縮；budget=1000"
+  "note": "共 3 則；已去重、壓縮；budget=1200；use_gnews=1"
 }
 ```
 
-**注意**
+**匹配與 fallback**
 
-* 若 `q` 有值但過濾後 **0 筆**：
-  會自動 fallback（只看標題匹配）→ 再不行取最高分前 n 則，確保不會回 0。
-* **快取規則**：
+* 非搜尋來源：`match=auto` 時需在**標題或正文**命中任一 token 才保留。
+* 若最終 0 筆：
 
-  * 命中且 `items>0` → 直接回快取
-  * `items==0` → 視為未命中，**重新抓**
-  * 只在 `items>0` 時寫入快取；否則清除舊條目
+  1. 退而只看「標題包含整段 `q`」；再不行
+  2. 取最高分前 n 則，**保證不回 0**。
+
+**快取規則**
+
+* `urlcache`（單頁正文）：TTL 24h
+* `qcache`（查詢結果）：TTL 8h
+
+  * **快取鍵**含：`q/n/lang/site/budget/match`
+  * 只在 `items>0` 時寫入；`items==0` 會刪除舊條目（視為未命中）
 
 ### `GET /fetch`
 
-摘要單一 URL（適合你在對話中貼單篇新聞/文章）。
+摘要單一 URL（適合在對話中貼新聞/文章）。
+
 **Query 參數**
 
-* `url` *(必填)*：網頁連結
-* `budget` *(選填)*：總字元上限（預設 800）
+* `url` *(必填)*
+* `budget` *(選填)*（預設 800）
 * `lang` *(選填)*：`zh` / `en`
 
 **回應範例**
@@ -165,66 +204,84 @@ http://127.0.0.1:8777/openapi.json
 ## 參數建議（搭配 Open-WebUI）
 
 * `n=5`、`budget=1000~1200`：新聞彙整的體感最佳
-* 只讓 LLM「列出標題/來源/日期 + 2–3 句摘要」，不要再叫模型自己去抓網頁
-* 需要「跨多篇深度歸納」時，再用小模型做二次摘要（輸入控制在 600–800 字）
+* 提示詞請**直接使用工具輸出**（已極短 & 去重），避免再次讓模型上網抓文
+* 若要做二次整合與重點歸納，建議把輸入控制在 **600–800 字**
 
 ---
 
 ## 調整來源
 
-在 `shortsearch.py` 上方的 `SOURCES` 陣列修改你的 RSS 清單，例如：
+在 `shortsearch.py` 上方調整 `SOURCES`：
 
 ```python
 SOURCES = [
-    "https://feedx.net/rss/cna.xml",            # 中央社 (總覽)
-    "https://www.ithome.com.tw/rss",              # iThome IT 新聞
-    "https://technews.tw/feed/"                   # TechNews 科技新報
-    # 你也可加入在地/教育類 RSS
+    "https://feedx.net/rss/cna.xml",
+    "https://www.ithome.com.tw/rss",
+    "https://technews.tw/feed/",
 ]
 ```
 
-> 先以 **少量可信來源** 上線，效果通常比大量泛抓更穩、更省 token。
+`SITE_FILTERS` 可限制 Google News 只搜某些域名（多個以 OR）：
+
+```python
+SITE_FILTERS = ["ithome.com.tw", "technews.tw"]
+```
+
+---
+
+## 偵錯與診斷
+
+* 單次開啟：
+
+  ```bash
+  curl -s --get "http://127.0.0.1:8777/search_news" \
+    --data-urlencode "q=3i atlas" \
+    --data-urlencode "n=10" \
+    --data-urlencode "debug=1" | jq .
+  ```
+* 全域開啟：
+
+  ```bash
+  export SHORTSEARCH_DEBUG=1
+  export SHORTSEARCH_DEBUG_DIR="./_debug"
+  uvicorn shortsearch:app --host 127.0.0.1 --port 8777 --reload
+  ```
+
+**會得到什麼？**
+
+* `diagnostics.sources[]`：每個 RSS 的 `status_code / entries / elapsed_ms / is_search`
+* `counters`：`entries_total / skipped_no_url / skipped_empty_title / skipped_nonmatch / gnews_resolved / exceptions`
+* 若某 feed 無 entries，原文會存成 `_debug/rss_empty_<ts>.xml`
 
 ---
 
 ## 常見問題（FAQ / Troubleshooting）
 
-**Q1. Open-WebUI 載入 `/openapi.json` 回 405？**
-A：已內建 CORS。若還見到 405，請確認你正在跑的是這個版本，或重啟服務。
-（`allow_origins=["*"]`、`allow_methods=["GET","OPTIONS"]` 已配置）
+**Q1. 為什麼 GNews 也被過濾到 0？**
+A：已改為 **不對 GNews 做本地關鍵字過濾**。若仍 0，請用 `debug=1` 檢查 `diagnostics.sources[].entries` 是否為 0（可能是暫時 403 或查無相關），或檢查 `site/SITE_FILTERS` 是否過度限縮。
 
-**Q2. 工具報 `n` 超過上限（例如 n=10）？**
-A：Open-WebUI 可能快取了舊 schema 或工具預設寫了 10。
-→ 在 Tools 介面 **Refresh/Reload schema** 或刪除後重加；並把 Default Args 的 `n` 改 ≤ 8。
-→ 伺服器端也會強制夾到 8。
+**Q2. 很慢或偶爾拿不到正文？**
+A：正文抽取失敗會退回 RSS 摘要。若想更快，可改成只用 RSS 摘要（我可以提供 `fetch_mode=rss_only` 的小 patch）。
 
-**Q3. `search_news` 帶 `q` 總是 0 筆，但不帶 `q` 卻有？**
-A：已修正匹配邏輯＆新增 fallback。若仍然全 0：
+**Q3. 一直看到舊結果？**
+A：新版本的快取鍵已含 `budget/match`。若你之前手動改過 DB 或有奇怪行為，可先刪除 `shortsearch.db` 讓它重建。
 
-* 嘗試其他關鍵字（確認來源 RSS 是否真的有該主題）
-* 檢查 `SOURCES` 的 RSS 是否暫時無法連線
-* 看 `shortsearch.db` 是否可寫（WSL 權限）
-
-**Q4. Open-WebUI 總是讀到舊的 schema？**
-A：重啟 shortsearch、瀏覽 `http://127.0.0.1:8777/openapi.json` 確認內容；
-在 Tools 裡 **Refresh**，或刪掉重加；必要時清空瀏覽器快取。
-
-**Q5. 需要對外網提供服務？**
-A：把啟動改成 `--host 0.0.0.0`，並調整防火牆與 `allow_origins` 白名單。
+**Q4. Open-WebUI 工具 schema 舊？**
+A：在 Tools 重新 **Refresh**；不行就刪掉重加，或清除瀏覽器快取。
 
 ---
 
 ## 安全與隱私
 
-* 僅使用你列的 RSS 來源，不會主動連大型商業搜尋 API
-* 本地 SQLite 快取，資料不離機器
-* 若需要更嚴格的 CORS，請把 `allow_origins` 換成你的 Open-WebUI 網址
+* 只連你列出的 RSS 與其對應的文章頁面
+* 本地 SQLite 快取，不外傳
+* 若需嚴格 CORS，請把 `allow_origins=["*"]` 換成你的 Open-WebUI 網址
 
 ---
 
 ## 一鍵啟動（可選）
 
-建立 `run-shortsearch.sh`：
+`run-shortsearch.sh`：
 
 ```bash
 #!/usr/bin/env bash
@@ -255,19 +312,22 @@ chmod +x run-shortsearch.sh
 
 ## 版本
 
-* `v0.2.0`
+* **v0.5.0**
 
-  * CORS、JSONResponse
-  * 快取：`items==0` 視為未命中；只在 `items>0` 時寫入
-  * 查詢匹配正規化＋雙重 fallback
-  * `n` 夾限至 8、`budget` 夾限 300–4000
+  * 來源帶屬性（`is_search`），GNews 不再本地過濾
+  * `debug=1` 診斷輸出（含落地空 feed）
+  * `match=auto|title|any|off`，僅對非搜尋來源生效
+  * CJK 友善摘要、標準 UA、GNews 轉址更穩
+  * `qcache` 鍵納入 `budget/match`
+
+* v0.2.0（舊）
+
+  * 基礎 CORS、快取、去重與 fallback
 
 ---
 
 ## 授權
 
-MIT（若需加入專案 LICENSE，建議使用 MIT/Apache-2.0 其中之一）。
+MIT（建議在專案加入 LICENSE 檔）。
 
 ---
-
-需要我把 README 另外存成檔案或幫你做個最小的 ZIP（含 `shortsearch.py`、README、run 腳本）嗎？
