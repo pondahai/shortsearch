@@ -303,7 +303,7 @@ LLM_SUMMARY_PROMPTS = {
     )
 }
 
-async def summarize_with_llm(text_content: str, title: str) -> str:
+async def summarize_with_llm(text_content: str, title: str, prompt_type: str = "default") -> str:
     if not settings.OPENAI_API_KEY:
         raise ValueError("OPENAI_API_KEY not configured.")
     if not text_content: return title
@@ -322,7 +322,7 @@ async def summarize_with_llm(text_content: str, title: str) -> str:
             max_tokens=500, temperature=0.2, timeout=90.0
         )
         summary = res.choices[0].message.content.strip()
-        LOG.info(f"LLM summary generated for '{title[:30]}...', length: {len(summary)}")
+        LOG.info(f"LLM summary (type: {prompt_type}) generated for '{title[:30]}...', length: {len(summary)}")
         return summary
     except Exception as e:
         LOG.error(f"LLM summarization failed: {e}")
