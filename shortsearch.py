@@ -51,6 +51,7 @@ class Settings(BaseSettings):
     OPENAI_API_KEY: Optional[str] = None
     OPENAI_BASE_URL: str = "https://api.openai.com/v1"
     OPENAI_MODEL: str = "gpt-4o-mini"
+    LLM_CONCURRENT_REQUESTS: int = 1  # <-- 新增：LLM 並發請求上限
     SELENIUM_HEADLESS: bool = True
     MIN_CONTENT_LEN_FOR_SELENIUM: int = 200
     DEBUG_MODE: bool = False
@@ -85,6 +86,8 @@ app.add_middleware(
 # --- 全域資源 ---
 REQ_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"}
 executor = ThreadPoolExecutor(max_workers=4)
+llm_semaphore = asyncio.Semaphore(settings.LLM_CONCURRENT_REQUESTS)
+LOG.info(f"LLM concurrency limit set to: {settings.LLM_CONCURRENT_REQUESTS}")
 
 # ==============================================================================
 # --- 3. 資料庫初始化 ---
@@ -308,25 +311,30 @@ async def summarize_with_llm(text_content: str, title: str, prompt_type: str = "
         raise ValueError("OPENAI_API_KEY not configured.")
     if not text_content: return title
 
-    client = openai.AsyncOpenAI(api_key=settings.OPENAI_API_KEY, base_url=settings.OPENAI_BASE_URL)
+    custom_headers = {
+        "ngrok-skip-browser-warning": "true"
+    }
+    client = openai.AsyncOpenAI(api_key=settings.OPENAI_API_KEY, base_url=settings.OPENAI_BASE_URL, default_headers=custom_headers)
 #     prompt = "你是一位資深新聞編輯，請將以下新聞內文濃縮成一段不超過150字的客觀、精簡中文摘要。請直接輸出摘要，不要任何開場白。"
     prompt = LLM_SUMMARY_PROMPTS.get(prompt_type, LLM_SUMMARY_PROMPTS["default"])
     
-    try:
-        res = await client.chat.completions.create(
-            model=settings.OPENAI_MODEL,
-            messages=[
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": f"標題：{title}\n\n內文：{text_content[:6000]}"}
-            ],
-            max_tokens=500, temperature=0.2, timeout=90.0
-        )
-        summary = res.choices[0].message.content.strip()
-        LOG.info(f"LLM summary (type: {prompt_type}) generated for '{title[:30]}...', length: {len(summary)}")
-        return summary
-    except Exception as e:
-        LOG.error(f"LLM summarization failed: {e}")
-        return f"摘要生成失敗：{e}"
+    async with llm_semaphore:
+        LOG.debug(f"Acquired semaphore for LLM call: '{title[:30]}...'")
+        try:
+            res = await client.chat.completions.create(
+                model=settings.OPENAI_MODEL,
+                messages=[
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": f"標題：{title}\n\n內文：{text_content[:6000]}"}
+                ],
+                max_tokens=500, temperature=0.2, timeout=390.0
+            )
+            summary = res.choices[0].message.content.strip()
+            LOG.info(f"LLM summary (type: {prompt_type}) generated for '{title[:30]}...', length: {len(summary)}")
+            return summary
+        except Exception as e:
+            LOG.error(f"LLM summarization failed: {e}")
+            return f"摘要生成失敗：{e}"
 
 # ==============================================================================
 # --- 7. 核心 API 端點 (完整版,支持自訂摘要規則) ---
